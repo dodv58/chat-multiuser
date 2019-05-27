@@ -2,7 +2,7 @@
 //  Dang Van Do
 //  17025077
 
-/  server.c
+//  server.c
 //  waiting for client at port 9999
 
 #include <stdio.h>
@@ -14,6 +14,7 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <pthread.h>
+#include "../circular-buffer.h"
 
 
 #define SERVER_PORT 9999
@@ -57,6 +58,7 @@ void remove_client(client_t* root, int cliSock){
     }
 }
 
+
 //function to add a client to list of clients
 void add_client(client_t* root, char* name, int socket){
     if(root->socket_id <= 0){
@@ -80,114 +82,91 @@ void *run(void *arg){
     int cliSock = *((int*)arg);
     char 	recvBuf[BUFFER_SIZE];
     char    sentBuf[BUFFER_SIZE] = {0};
-    char    msg[2*BUFFER_SIZE];
+    char    msg[BUFFER_SIZE];
     int 	n;
     char    username[100] = {0};
     char cmd[100] = {0};
     char sender[100] = {0};
     char receiver[100] = {0};
+    cbuffer_t cbuff;
+    cbuffer_init(&cbuff);
+
     client_t* client;
     while (1){
-        n = read(cliSock, recvBuf, BUFFER_SIZE-1);
-        recvBuf[n] = '\0';
-        if (n == 0 || recvBuf[0] == 'q'){ //@EXIT client disconnects
-            close(cliSock);
-            remove_client(clients, cliSock);
-            client = clients;
-            while(client != NULL && client->socket_id > 0){//send noti to the others
-                sprintf(msg, "q %s", username);
-                send(client->socket_id, msg, strlen(msg), 0);
-                client = client->next;
-            }
-            printf("Close the connection\n");
-            break;
-        }
-        else if(recvBuf[0] == 'c'){//client connects
-            memcpy(username, &recvBuf[1], strlen(recvBuf) - 1);
-            //send noti to others user
-            client = clients;
-            while(client != NULL){ //check if user is exists or not
-                if(client->socket_id > 0 && strcmp(username, client->name) == 0){
-                    int retval = -9999;
-                    send(cliSock, &retval, sizeof(int), 0);
+        n = read(cliSock, recvBuf, BUFFER_SIZE);
+        if(n > 0){
+            cbuffer_insert(&cbuff, recvBuf, n);
+            n = cbuffer_get_msg(&cbuff, msg, sizeof(msg));
+            if(n > 0){
+                sscanf(&msg[sizeof(int) + 3], "%s%s", sender, receiver);
+
+                if(msg[sizeof(int)] == '#' && msg[sizeof(int) + 1] == 'q'){
+                    close(cliSock);
+                    remove_client(clients, cliSock);
+                    client = clients;
+                    while(client != NULL && client->socket_id > 0){//send noti to the others
+                        send(client->socket_id, msg, n, 0);
+                        client = client->next;
+                    }
+                    printf("Close the connection\n");
                     break;
                 }
-                client = client->next;
-            }
-
-            if(client == NULL){//the user is not exists
-                int count = 0;
-                client = clients;
-                while(client != NULL){
-                    if(client->socket_id > 0){
-                        sprintf(msg, "c %s", username);
-                        send(client->socket_id, msg, strlen(msg), 0);
-                        count++;
-                    }
-                    client = client->next;
-                }
-                add_client(clients, username, cliSock);
-                send(cliSock, &count, sizeof(int), 0);
-                client = clients;
-                while(count > 0 && client->next != NULL){
-                    sprintf(msg, "%s\n", client->name);
-                    send(cliSock, msg, strlen(msg), 0);
-                    client = client->next;
-                }
-            }
-        }
-        else {
-            sscanf(recvBuf, "%s%s%s", cmd, sender, receiver);
-
-            client = clients;
-
-            if(strcmp(receiver, "#") == 0){//send msg to all of users
-                while(client != NULL){
-                    if(strcmp(username, client->name) != 0){
-                        send(client->socket_id, recvBuf, strlen(recvBuf), 0);
-                    }
-                    client = client->next;
-                }
-            }
-            else {//send msg to a user
-                while(client != NULL){
-                    if(strcmp(client->name, receiver) == 0){
-                        send(client->socket_id, recvBuf, strlen(recvBuf), 0);
-                    }
-                    client = client->next;
-                }
-            }
-
-            if(cmd[1] == 'f'){
-                int count = 0;
-                char filename[100] = {0};
-                int size = 0;
-                sscanf(recvBuf, "%s%s%s%s%d", cmd, sender, receiver, filename, &size);
-                printf("file size %d\n", size);
-                while(size > 0){
-                    n = read(cliSock, recvBuf, BUFFER_SIZE);
-                    count += n;
-                    printf("%d\n", count);
+                else if(msg[sizeof(int)] == '#' && msg[sizeof(int) + 1] == 'c'){
+                    sscanf(&msg[sizeof(int) + 3], "%s", username);
+                    //send noti to others user
                     client = clients;
-                    if(strcmp(receiver, "#") == 0){//send msg to all of users
+                    while(client != NULL){ //check if user is exists or not
+                        if(client->socket_id > 0 && strcmp(username, client->name) == 0){
+                            int retval = -9999;
+                            send(cliSock, &retval, sizeof(int), 0);
+                            break;
+                        }
+                        client = client->next;
+                    }
+
+                    if(client == NULL){//the user is not exists
+                        int count = 0;
+                        client = clients;
+                        while(client != NULL){
+                            if(client->socket_id > 0){
+                                send(client->socket_id, msg, n, 0);
+                                count++;
+                            }
+                            client = client->next;
+                        }
+                        add_client(clients, username, cliSock);
+                        send(cliSock, &count, sizeof(int), 0);
+                        client = clients;
+                        while(count > 0 && client->next != NULL){
+                            sprintf(msg, "#c %s", client->name);
+                            int len = sizeof(int) + strlen(msg);
+                            memmove(sentBuf, &len, sizeof(int));
+                            memmove(&sentBuf[sizeof(int)], msg, strlen(msg));
+                            send(cliSock, sentBuf, len, 0);
+                            client = client->next;
+                        }
+                    }
+                }
+                else {
+                    client = clients;
+                    if(strcmp(receiver, "#") == 0){
                         while(client != NULL){
                             if(strcmp(username, client->name) != 0){
-                                send(client->socket_id, recvBuf, n, 0);
+                                send(client->socket_id, msg, n, 0);
                             }
                             client = client->next;
                         }
                     }
-                    else {//send msg to a user
+                    else {
                         while(client != NULL){
                             if(strcmp(client->name, receiver) == 0){
-                                send(client->socket_id, recvBuf, n, 0);
+                                send(client->socket_id, msg, n, 0);
                             }
                             client = client->next;
                         }
                     }
-                    size -= n;
                 }
-                printf("file sent!!!\n");
+
             }
         }
     }

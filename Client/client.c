@@ -17,6 +17,8 @@
 #include <pthread.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include "../circular-buffer.h"
+
 #define SERVER_PORT 9999
 #define BUFFER_SIZE 1024
 
@@ -27,56 +29,64 @@ void *run(void* arg){//wait for msg from server
     char cmd[100] = {0};
     char sender[100] = {0};
     char receiver[100] = {0};
+    cbuffer_t cbuff;
+    cbuffer_init(&cbuff);
+    char msg[BUFFER_SIZE] = {0};
+    FILE* f;
+    int f_size = 0;
+
     while(1){
         recvDataLen = read(connSock, recvBuf, BUFFER_SIZE);
         if (recvDataLen < 0){
             printf("Error when receiving data\n");
             break;
         }
-        recvBuf[recvDataLen] = '\0';
-        sscanf(recvBuf, "%s", cmd);
-        if(strcmp(cmd, "c") == 0){
-            char username[100] = {0};
-            sscanf(recvBuf, "%s%s", cmd, username);
-            printf("%s connected\n", username);
-        }
-        else if(strcmp(cmd, "q") == 0){
-            char username[100] = {0};
-            sscanf(recvBuf, "%s%s", cmd, username);
-            printf("%s disconnected\n", username);
-        }
-        else if(cmd[1] ==  'f'){
-            char filename[100] = {0};
-            int size = 0;
-            sscanf(recvBuf, "%s%s%s%s%d", cmd, sender, receiver, filename, &size);      
-            int ctx_idx = strlen(cmd) + strlen(sender) + strlen(receiver) + 3;
-            printf("%s %d\n", filename, size);
-            FILE *f = fopen(filename, "wb");
-            while(size > 0){
-                recvDataLen = read(connSock, recvBuf, sizeof(recvBuf));
-                printf("%d\n", size);
-                if (recvDataLen < 0){
-                    printf("Error when sending data\n");
-                    break;
-                }
-                else {
-                    
-                    fwrite(recvBuf, recvDataLen, 1, f);
-                }
-                size -= recvDataLen;
+        cbuffer_insert(&cbuff, recvBuf, recvDataLen);
+        int msg_len = cbuffer_get_msg(&cbuff, msg, sizeof(msg));
+        int int_size = sizeof(int);
+        if(msg_len > 0){
+            if(msg[int_size] == '#' && msg[int_size + 1] == 'c'){
+                char username[100] = {0};
+                sscanf(&msg[int_size + 3], "%s", username);
+                printf("%s connected\n", username);
             }
-            fclose(f);
-                printf("file received!!!\n");
-        }
-        else {
-            char ctx[BUFFER_SIZE] = {0};
-            sscanf(recvBuf, "%s%s%s", cmd, sender, receiver);
-            int idx = strlen(cmd) + strlen(sender) + strlen(receiver) + 3;
-            printf("msg from %s: %s\n", sender, &recvBuf[idx]);
+            else if(msg[int_size] == '#' && msg[int_size + 1] == 'q'){
+                char username[100] = {0};
+                sscanf(&msg[int_size + 3], "%s", username);
+                printf("%s disconnected\n", username);
+            }
+            else if(msg[int_size] == '@' && msg[int_size + 1] == 'm'){
+                char ctx[BUFFER_SIZE] = {0};
+                sscanf(&msg[int_size + 3], "%s%s%s", sender, receiver, ctx);
+                printf("msg from %s: %s\n", sender, ctx);
+            }
+            else if(msg[int_size] == '@' && msg[int_size + 1] == 'f'){
+                char filename[100] = {0};
+                sscanf(&msg[int_size + 3], "%s%s%s%d", sender, receiver, filename, &f_size);      
+                printf("===> %s %d\n", filename, f_size);
+                f = fopen(filename, "wb");
+            }
+            else if(msg[int_size] == '@' && msg[int_size + 1] == 'd'){
+                sscanf(&msg[int_size + 3], "%s%s", sender, receiver);      
+                int header_len = int_size + 3 + strlen(sender) + strlen(receiver) + 2;
+                fwrite(&msg[header_len], msg_len - header_len, 1, f);
+                f_size -= msg_len - header_len;
+                if(f_size <= 0){
+                    fclose(f);
+                    printf("file received!!!\n");
+                }
+            }
         }
     }
     close(connSock);
     return NULL;
+}
+
+int create_msg(char* dest, char* msg){
+    int len = strlen(msg) + sizeof(int);
+    memmove(dest, &len, sizeof(int));
+    memmove(&dest[sizeof(int)], msg, strlen(msg));
+    return len;
 }
 
 int main(int argc, char **argv){
@@ -87,7 +97,7 @@ int main(int argc, char **argv){
     char sentBuf[BUFFER_SIZE], recvBuf[BUFFER_SIZE];
     int  sentDataLen, recvDataLen;
     char args[100] = {0};
-    char msg[100] = {0};
+    char msg[BUFFER_SIZE] = {0};
     
     if (argc >= 3){
         strcpy(serverAddress,argv[1]);
@@ -115,10 +125,12 @@ int main(int argc, char **argv){
     printf("Connected to the server ...\nPlease enter your name:");
 
     int user_count = -1;
+    char name[100];
     while(user_count < 0){//try to register
-        scanf("%[^\n]%*c", sentBuf);
-        sprintf(msg, "c%s", sentBuf);
-        sentDataLen = write(connSock, msg, strlen(msg));
+        scanf("%[^\n]%*c", name);
+        sprintf(msg, "#c %s #", name);
+        int len = create_msg(sentBuf, msg);
+        sentDataLen = write(connSock, sentBuf, len);
         if (sentDataLen < 0){
             printf("Error when sending data\n");
             exit(1);
@@ -133,17 +145,21 @@ int main(int argc, char **argv){
         }
     }
     printf("Current users:\n");
+    cbuffer_t buff;
+    cbuffer_init(&buff);
     while(user_count > 0){
         recvDataLen = read(connSock, recvBuf, BUFFER_SIZE);
-        recvBuf[recvDataLen] = '\0';
-        printf("%s", recvBuf);
-        for(int i = 0; i < recvDataLen; i++){
-            if(recvBuf[i] == '\n'){
+        cbuffer_insert(&buff, recvBuf, recvDataLen);
+        int len = 0;
+        do {
+            len = cbuffer_get_msg(&buff, msg, sizeof(msg));
+            if(len > 0){
+                printf("%s connected\n", &msg[sizeof(int) + 3]);
                 user_count -= 1;
             }
-        }
+        } while(len > 0);
     }
-    printf("You are connected!!!\nType @EXIT to quit, @<username> <msg> to send msg to another user, #<msg> to broadcast your msg\n");
+    printf("You are connected!!!\nType @EXIT to quit, @m <sender> <receiver> <msg> to send msg to another user, #f <sender> <receiver> <filename> to send file\n");
     pthread_t tid; 
     pthread_create(&tid, NULL, &run, (void *) &connSock);
     char cmd[100] = {0};
@@ -154,8 +170,9 @@ int main(int argc, char **argv){
     while(1){//waiting for user input
         scanf("%[^\n]%*c", sentBuf);
         if (strcmp(sentBuf,"@EXIT") == 0){
-            sentBuf[0] = 'q';
-            send(connSock, sentBuf, 1, 0);
+            sprintf(msg, "#q %s #", name);
+            int len = create_msg(sentBuf, msg);
+            send(connSock, sentBuf, len, 0);
             break;
         }
         else if(sentBuf[0] == '@') {
@@ -166,18 +183,26 @@ int main(int argc, char **argv){
                 stat(ctx, &obj);
                 int size = obj.st_size;
                 if (size > 0){
-                    sprintf(sentBuf, "%s %s %s %s %d", cmd, sender, recv, ctx, size);
-                    send(connSock, sentBuf, strlen(sentBuf), 0);
+                    sprintf(msg, "%s %s %s %s %d", cmd, sender, recv, ctx, size);
+                    int len = create_msg(sentBuf, msg);
+                    send(connSock, sentBuf, len, 0);
                     int bytes_read = 0;
                     FILE *f = fopen(ctx, "rb");
+                    char data[100] = {0};
+                    cmd[1] = 'd';
                     while(!feof(f)){
-                        bytes_read = fread(&sentBuf, 1, BUFFER_SIZE, f);
+                        sprintf(msg, "%s %s %s ", cmd, sender, recv);
+                        int _idx = strlen(msg);
+                        bytes_read = fread(data, 1, BUFFER_SIZE - _idx - sizeof(int), f);
                         count +=  bytes_read;
-                        printf("%d\n", count);
                         if(bytes_read < 0){
                             break;
                         }
-                        send(connSock, sentBuf, bytes_read, 0);
+                        memmove(&msg[_idx], data, bytes_read);
+                        int len = bytes_read + _idx + sizeof(int);
+                        memmove(sentBuf, &len, sizeof(int));
+                        memmove(&sentBuf[sizeof(int)], msg, len-sizeof(int) );
+                        send(connSock, sentBuf, len, 0);
                     }
                     fclose(f);
                 }
@@ -185,7 +210,11 @@ int main(int argc, char **argv){
 
             }
             else if(cmd[1] == 'm'){
-                send(connSock, sentBuf, strlen(sentBuf), 0); 
+                int msg_len = strlen(sentBuf) + sizeof(int);
+                printf("msg len %d\n", msg_len);
+                memmove(msg, &msg_len, sizeof(int));
+                memmove(&msg[sizeof(int)], sentBuf, strlen(sentBuf));
+                send(connSock, msg, msg_len, 0); 
             }
         }
     }
